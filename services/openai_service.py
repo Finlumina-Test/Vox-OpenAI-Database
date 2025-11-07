@@ -127,14 +127,25 @@ class OpenAISessionManager:
     async def create_session_update_with_menu(restaurant_id: str) -> Dict[str, Any]:
         """
         Create a session update with restaurant menu context from database.
+        
+        🔥 THIS IS THE KEY METHOD - It loads menu from database and builds the AI prompt
         """
         
         # 🔥 GET MENU FROM DATABASE
-        restaurant_info = await db.get_restaurant_info(restaurant_id)
-        menu_data = await db.get_full_menu(restaurant_id)
-        
-        # Build menu context for AI
-        menu_context = OpenAISessionManager._build_menu_context(restaurant_info, menu_data)
+        try:
+            restaurant_info = await db.get_restaurant_info(restaurant_id)
+            menu_data = await db.get_full_menu(restaurant_id)
+            
+            if not restaurant_info or not menu_data.get('items'):
+                Log.warning(f"⚠️ No menu data found for {restaurant_id}, using fallback")
+                menu_context = "MENU DATA NOT AVAILABLE - Please inform customer to call back later."
+            else:
+                # Build menu context for AI
+                menu_context = OpenAISessionManager._build_menu_context(restaurant_info, menu_data)
+                Log.info(f"✅ Loaded menu: {len(menu_data['items'])} items in {len(menu_data.get('categories', []))} categories")
+        except Exception as e:
+            Log.error(f"❌ Failed to load menu from database: {e}")
+            menu_context = "MENU DATA NOT AVAILABLE - Please inform customer to call back later."
         
         # Build complete instructions
         complete_instructions = f"""{Config.SYSTEM_MESSAGE}
@@ -217,17 +228,21 @@ You: "Sorry, I didn't catch that. What would you like to order?"
     
     @staticmethod
     def _build_menu_context(restaurant_info: Optional[Dict], menu_data: Dict) -> str:
-        """Build a formatted menu context for AI."""
+        """
+        Build a formatted menu context for AI.
+        
+        🔥 THIS FORMATS THE DATABASE MENU INTO A READABLE FORMAT FOR THE AI
+        """
         
         if not restaurant_info:
             return "MENU DATA NOT AVAILABLE - Please inform customer to call back later."
         
         context = f"""
 ==================== RESTAURANT INFORMATION ====================
-Name: {restaurant_info.get('name')}
-Phone: {restaurant_info.get('phone')}
-Address: {restaurant_info.get('address')}
-Cuisine: {restaurant_info.get('cuisine_type')}
+Name: {restaurant_info.get('name', 'Our Restaurant')}
+Phone: {restaurant_info.get('phone', 'N/A')}
+Address: {restaurant_info.get('address', 'N/A')}
+Cuisine: {restaurant_info.get('cuisine_type', 'N/A')}
 Delivery Fee: ${restaurant_info.get('delivery_fee', 0):.2f}
 Minimum Order: ${restaurant_info.get('minimum_order', 0):.2f}
 Estimated Delivery: {restaurant_info.get('estimated_delivery_time', '30-45 minutes')}
@@ -245,18 +260,20 @@ Payment Methods: {', '.join(restaurant_info.get('payment_methods', ['cash', 'car
             items_by_category[category].append(item)
         
         # Format menu
-        for category, items in items_by_category.items():
+        for category, items in sorted(items_by_category.items()):
             context += f"\n--- {category.upper()} ---\n"
             for item in items:
                 price = f"${item['price']:.2f}"
-                available = "✓" if item['is_available'] else "✗ UNAVAILABLE"
+                available = "✓ AVAILABLE" if item.get('is_available', True) else "✗ UNAVAILABLE"
                 popular = " ⭐ POPULAR" if item.get('is_popular') else ""
                 spicy = " 🌶️ SPICY" if item.get('is_spicy') else ""
                 veggie = " 🌱 VEGETARIAN" if item.get('is_vegetarian') else ""
                 
                 context += f"\n• {item['name']} - {price} [{available}]{popular}{spicy}{veggie}\n"
                 if item.get('description'):
-                    context += f"  {item['description']}\n"
+                    context += f"  Description: {item['description']}\n"
+                if item.get('allergens'):
+                    context += f"  ⚠️ Allergens: {item['allergens']}\n"
         
         context += "\n==================== END OF MENU ====================\n"
         
@@ -376,6 +393,11 @@ class TranscriptFilter:
 class OpenAIService:
     """
     Unified service for OpenAI Realtime API with database-backed menu.
+    
+    🔥 KEY CHANGES:
+    - initialize_session() now requires restaurant_id parameter
+    - Loads menu from database via OpenAISessionManager
+    - Tracks restaurant_id for the session
     """
 
     def __init__(self):
@@ -403,13 +425,23 @@ class OpenAIService:
         self.human_takeover_active: bool = False
         self.human_audio_callback: Optional[callable] = None
         
-        # 🔥 ADD: Track restaurant ID
+        # 🔥 ADD: Track restaurant ID for this session
         self.restaurant_id: Optional[str] = None
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager, restaurant_id: str) -> None:
-        """Initialize OpenAI session with menu from database."""
+        """
+        Initialize OpenAI session with menu from database.
+        
+        🔥 CHANGED: Now REQUIRES restaurant_id parameter
+        
+        Args:
+            connection_manager: WebSocket connection manager
+            restaurant_id: Restaurant ID to load menu from database (e.g. 'restaurant_a')
+        """
         self.restaurant_id = restaurant_id
+        
+        Log.info(f"🍽️ Initializing session for restaurant: {restaurant_id}")
         
         # Get session with menu context from database
         session_update = await self.session_manager.create_session_update_with_menu(restaurant_id)
@@ -420,6 +452,8 @@ class OpenAIService:
         # Auto-send greeting after session is ready
         await asyncio.sleep(0.5)
         await self.send_initial_greeting(connection_manager)
+        
+        Log.info(f"✅ OpenAI session initialized with menu for {restaurant_id}")
 
     async def send_initial_greeting(self, connection_manager) -> None:
         """Send the initial greeting automatically."""

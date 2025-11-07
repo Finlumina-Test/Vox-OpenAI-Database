@@ -1,5 +1,5 @@
-# server.py - FINAL WORKING VERSION
-# Just copy this entire file and replace your server.py
+# server.py - INTEGRATED VERSION WITH DATABASE
+# Complete working version with database integration
 
 import os
 import json
@@ -7,6 +7,7 @@ import time
 import base64
 import asyncio
 from typing import Set, Optional, Dict, Any
+from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import JSONResponse
@@ -24,6 +25,7 @@ from services import (
 from services.transcription_service import TranscriptionService
 from services.log_utils import Log
 from services.silence_detection import SilenceDetector
+from services.database import db  # 🔥 ADD: Import database service
 
 
 class DashboardClient:
@@ -86,6 +88,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 🔥 ADD: Startup and shutdown handlers for database
+@app.on_event("startup")
+async def startup():
+    """Initialize database connection on startup."""
+    await db.connect()
+    Log.info("🚀 Server startup complete")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close database connection on shutdown."""
+    await db.close()
+    Log.info("🛑 Server shutdown complete")
 
 
 @app.get("/", response_class=JSONResponse)
@@ -391,6 +408,10 @@ async def handle_media_stream(websocket: WebSocket):
     ai_silence_detector = SilenceDetector()
     
     current_call_sid: Optional[str] = None
+    # 🔥 ADD: Track restaurant_id and database IDs for this call
+    current_restaurant_id: Optional[str] = None
+    call_db_id: Optional[str] = None
+    call_start_time: Optional[float] = None
     
     ai_audio_queue = asyncio.Queue()
     ai_stream_task = None
@@ -449,9 +470,11 @@ async def handle_media_stream(websocket: WebSocket):
         if not speaker or not text:
             return
         
+        # Skip AI transcripts during human takeover
         if speaker == "AI" and openai_service.is_human_in_control():
             return
         
+        # Broadcast transcript
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -460,6 +483,20 @@ async def handle_media_stream(websocket: WebSocket):
             "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+
+        # 🔥 ADD: Save transcript to database
+        if current_call_sid:
+            try:
+                await db.add_transcript(
+                    call_sid=current_call_sid,
+                    speaker=speaker,
+                    text=text,
+                    timestamp=datetime.fromtimestamp(
+                        transcription_data.get("timestamp", time.time() * 1000) / 1000
+                    )
+                )
+            except Exception as e:
+                Log.error(f"[Database] Failed to save transcript: {e}")
 
         try:
             order_extractor.add_transcript(speaker, text)
@@ -477,12 +514,7 @@ async def handle_media_stream(websocket: WebSocket):
             await connection_manager.close_openai_connection()
             return
 
-        try:
-            await openai_service.initialize_session(connection_manager)
-        except Exception as e:
-            Log.error(f"OpenAI session initialization failed: {e}")
-            await connection_manager.close_openai_connection()
-            return
+        # 🔥 CHANGED: Don't initialize session yet - wait for restaurant_id in on_start_cb
 
         async def handle_media_event(data: dict):
             if data.get("event") == "media":
@@ -630,30 +662,80 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.info("Renewing OpenAI session…")
                     await connection_manager.close_openai_connection()
                     await connection_manager.connect_to_openai()
-                    await openai_service.initialize_session(connection_manager)
+                    # 🔥 CHANGED: Use restaurant_id in session renewal
+                    if current_restaurant_id:
+                        await openai_service.initialize_session(
+                            connection_manager,
+                            current_restaurant_id
+                        )
+                    else:
+                        await openai_service.initialize_session(connection_manager)
                     Log.info("Session renewed successfully.")
                 except Exception as e:
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
-            nonlocal current_call_sid, ai_stream_task
-            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
-            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+            nonlocal current_call_sid, ai_stream_task, current_restaurant_id, call_db_id, call_start_time
             
+            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
+            call_start_time = time.time()
+            
+            # 🔥 ADD: Get restaurant_id from Twilio custom parameters
+            # You'll need to pass this when creating the call
+            # For now, use a default or extract from connection state
+            current_restaurant_id = getattr(
+                connection_manager.state, 
+                'restaurant_id', 
+                'restaurant_a'  # Default fallback
+            )
+            
+            Log.event("Twilio Start", {
+                "streamSid": stream_sid, 
+                "callSid": current_call_sid,
+                "restaurantId": current_restaurant_id
+            })
+            
+            # 🔥 CREATE DATABASE RECORD FOR CALL
+            try:
+                call_db_id = await db.create_call(
+                    call_sid=current_call_sid,
+                    restaurant_id=current_restaurant_id,
+                    caller_phone=getattr(connection_manager.state, 'caller_phone', None)
+                )
+                Log.info(f"✅ Created call record in database: {call_db_id}")
+            except Exception as e:
+                Log.error(f"❌ Failed to create call in database: {e}")
+            
+            # 🔥 INITIALIZE OPENAI SESSION WITH MENU FROM DATABASE
+            try:
+                await openai_service.initialize_session(
+                    connection_manager, 
+                    current_restaurant_id
+                )
+                Log.info(f"✅ OpenAI session initialized with menu for {current_restaurant_id}")
+            except Exception as e:
+                Log.error(f"❌ Failed to initialize OpenAI session: {e}")
+                return
+            
+            # Reset silence detectors
             caller_silence_detector.reset()
             ai_silence_detector.reset()
             
+            # Start AI audio streamer
             if ai_stream_task is None or ai_stream_task.done():
                 ai_stream_task = asyncio.create_task(ai_audio_streamer())
                 Log.info("[AI Streamer] Task started")
             
+            # Register this call
             active_calls[current_call_sid] = {
                 "openai_service": openai_service,
                 "connection_manager": connection_manager,
                 "audio_service": audio_service,
                 "transcription_service": transcription_service,
                 "order_extractor": order_extractor,
-                "human_audio_ws": None
+                "human_audio_ws": None,
+                "restaurant_id": current_restaurant_id,  # 🔥 ADD
+                "call_db_id": call_db_id  # 🔥 ADD
             }
             Log.info(f"[ActiveCalls] Registered call {current_call_sid}")
 
@@ -690,6 +772,27 @@ async def handle_media_stream(websocket: WebSocket):
                 await asyncio.wait([ai_stream_task], timeout=2.0)
         except Exception:
             pass
+        
+        # 🔥 ADD: Save order to database
+        try:
+            final_order = order_extractor.get_current_order()
+            if any(final_order.values()) and current_call_sid:
+                order_id = await db.create_order(
+                    call_sid=current_call_sid,
+                    order_data=final_order
+                )
+                Log.info(f"📦 Saved order to database: {order_id}")
+        except Exception as e:
+            Log.error(f"❌ Failed to save order: {e}")
+        
+        # 🔥 ADD: Mark call as ended in database
+        if current_call_sid:
+            try:
+                duration = int((time.time() - (call_start_time or time.time())))
+                await db.end_call(current_call_sid, duration)
+                Log.info(f"📞 Call ended in database: {current_call_sid} (duration: {duration}s)")
+            except Exception as e:
+                Log.error(f"❌ Failed to end call in DB: {e}")
         
         try:
             final_summary = order_extractor.get_order_summary()

@@ -4,6 +4,7 @@ import time
 from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
+from services.database import db
 
 
 class OpenAIEventHandler:
@@ -119,12 +120,55 @@ Examples:
 
 class OpenAISessionManager:
     """
-    Configures and initializes OpenAI Realtime API sessions.
+    Configures and initializes OpenAI Realtime API sessions with database menu.
     """
 
     @staticmethod
-    def create_session_update() -> Dict[str, Any]:
-        """Create a session update message for OpenAI Realtime API."""
+    async def create_session_update_with_menu(restaurant_id: str) -> Dict[str, Any]:
+        """
+        Create a session update with restaurant menu context from database.
+        """
+        
+        # 🔥 GET MENU FROM DATABASE
+        restaurant_info = await db.get_restaurant_info(restaurant_id)
+        menu_data = await db.get_full_menu(restaurant_id)
+        
+        # Build menu context for AI
+        menu_context = OpenAISessionManager._build_menu_context(restaurant_info, menu_data)
+        
+        # Build complete instructions
+        complete_instructions = f"""{Config.SYSTEM_MESSAGE}
+
+{menu_context}
+
+CRITICAL RULES FOR USING MENU:
+1. ONLY mention items that are in the menu above
+2. ALWAYS use the EXACT prices from the menu
+3. If customer asks about an item not in the menu, say "We don't have that, but we have..."
+4. If an item is marked as unavailable, inform the customer
+5. Recommend popular items when asked for suggestions
+6. Mention if items are vegetarian, spicy, etc. when relevant
+
+CLARIFICATION RULES:
+- If you're NOT 100% confident about what customer said, ASK them to repeat
+- NEVER guess order items - always confirm unclear menu items
+- If audio is unclear, say: "Sorry, I didn't catch that. Could you repeat?"
+- For names/addresses/phones, ALWAYS repeat back for confirmation
+
+EXAMPLE INTERACTIONS:
+Customer: "How much is a pepperoni pizza?"
+You: "The Pepperoni Pizza is $14.99"
+
+Customer: "What do you recommend?"
+You: "Our most popular items are the Pepperoni Pizza and Meat Lovers Pizza!"
+
+Customer: "Do you have tacos?"
+You: "We don't have tacos, but we have amazing pizzas! Would you like to hear our menu?"
+
+Customer: [unclear audio]
+You: "Sorry, I didn't catch that. What would you like to order?"
+"""
+        
         session = {
             "type": "session.update",
             "session": {
@@ -137,9 +181,9 @@ class OpenAISessionManager:
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.4,  # 🔥 More aggressive (lower = triggers easier)
-                            "prefix_padding_ms": 200,  # Less padding for faster detection
-                            "silence_duration_ms": 300  # 🔥 Very fast interruption
+                            "threshold": 0.4,
+                            "prefix_padding_ms": 200,
+                            "silence_duration_ms": 300
                         },
                         "transcription": {
                             "model": "whisper-1",
@@ -148,25 +192,19 @@ class OpenAISessionManager:
                     "output": {"format": {"type": "audio/pcmu"}}
                 },
 
-                "instructions": (
-                    Config.SYSTEM_MESSAGE
-                    + "\n\nRespond naturally to customer queries about orders, menu items, and delivery."
-                ),
+                "instructions": complete_instructions,
 
                 "tools": [
                     {
                         "type": "function",
                         "name": "end_call",
-                        "description": (
-                            "Politely end the phone call when the caller says goodbye "
-                            "or requests to end the conversation."
-                        ),
+                        "description": "End the phone call when customer says goodbye",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "reason": {
                                     "type": "string",
-                                    "description": "Brief reason for ending, e.g., user said bye."
+                                    "description": "Brief reason for ending"
                                 }
                             },
                             "required": []
@@ -176,7 +214,53 @@ class OpenAISessionManager:
             }
         }
         return session
+    
+    @staticmethod
+    def _build_menu_context(restaurant_info: Optional[Dict], menu_data: Dict) -> str:
+        """Build a formatted menu context for AI."""
+        
+        if not restaurant_info:
+            return "MENU DATA NOT AVAILABLE - Please inform customer to call back later."
+        
+        context = f"""
+==================== RESTAURANT INFORMATION ====================
+Name: {restaurant_info.get('name')}
+Phone: {restaurant_info.get('phone')}
+Address: {restaurant_info.get('address')}
+Cuisine: {restaurant_info.get('cuisine_type')}
+Delivery Fee: ${restaurant_info.get('delivery_fee', 0):.2f}
+Minimum Order: ${restaurant_info.get('minimum_order', 0):.2f}
+Estimated Delivery: {restaurant_info.get('estimated_delivery_time', '30-45 minutes')}
+Payment Methods: {', '.join(restaurant_info.get('payment_methods', ['cash', 'card']))}
 
+==================== COMPLETE MENU ====================
+"""
+        
+        # Organize items by category
+        items_by_category = {}
+        for item in menu_data.get('items', []):
+            category = item.get('category_name', 'Other')
+            if category not in items_by_category:
+                items_by_category[category] = []
+            items_by_category[category].append(item)
+        
+        # Format menu
+        for category, items in items_by_category.items():
+            context += f"\n--- {category.upper()} ---\n"
+            for item in items:
+                price = f"${item['price']:.2f}"
+                available = "✓" if item['is_available'] else "✗ UNAVAILABLE"
+                popular = " ⭐ POPULAR" if item.get('is_popular') else ""
+                spicy = " 🌶️ SPICY" if item.get('is_spicy') else ""
+                veggie = " 🌱 VEGETARIAN" if item.get('is_vegetarian') else ""
+                
+                context += f"\n• {item['name']} - {price} [{available}]{popular}{spicy}{veggie}\n"
+                if item.get('description'):
+                    context += f"  {item['description']}\n"
+        
+        context += "\n==================== END OF MENU ====================\n"
+        
+        return context
 
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
@@ -190,8 +274,7 @@ class OpenAISessionManager:
                     {
                         "type": "input_text",
                         "text": (
-                            "Greet the caller warmly with: 'Hello! Welcome to Finlumina Demo Vox. "
-                            "I'm your AI voice assistant powered by advanced realtime technology. "
+                            "Greet the caller warmly with: 'Hello! Welcome to our restaurant. "
                             "How can I help you today?'"
                         )
                     }
@@ -275,7 +358,6 @@ class TranscriptFilter:
         if len(cleaned) < TranscriptFilter.MIN_TRANSCRIPT_LENGTH:
             return False
         
-        # ✅ Allow all Human transcripts through
         if speaker == "Human":
             return True
         
@@ -293,7 +375,7 @@ class TranscriptFilter:
 
 class OpenAIService:
     """
-    Unified service for OpenAI Realtime API with human takeover support.
+    Unified service for OpenAI Realtime API with database-backed menu.
     """
 
     def __init__(self):
@@ -320,15 +402,23 @@ class OpenAIService:
         # Human takeover state
         self.human_takeover_active: bool = False
         self.human_audio_callback: Optional[callable] = None
+        
+        # 🔥 ADD: Track restaurant ID
+        self.restaurant_id: Optional[str] = None
 
     # --- SESSION & GREETING ---
-    async def initialize_session(self, connection_manager) -> None:
-        session_update = self.session_manager.create_session_update()
-        Log.json('Sending session update', session_update)
+    async def initialize_session(self, connection_manager, restaurant_id: str) -> None:
+        """Initialize OpenAI session with menu from database."""
+        self.restaurant_id = restaurant_id
+        
+        # Get session with menu context from database
+        session_update = await self.session_manager.create_session_update_with_menu(restaurant_id)
+        
+        Log.json('Sending session update with menu', session_update)
         await connection_manager.send_to_openai(session_update)
         
-        # ✅ Auto-send greeting after session is ready
-        await asyncio.sleep(0.5)  # Small delay to ensure session is established
+        # Auto-send greeting after session is ready
+        await asyncio.sleep(0.5)
         await self.send_initial_greeting(connection_manager)
 
     async def send_initial_greeting(self, connection_manager) -> None:
@@ -348,7 +438,6 @@ class OpenAIService:
     def disable_human_takeover(self):
         """Disable human takeover mode - AI resumes."""
         self._human_takeover_active = False
-        # ✅ Reset transcript timing to prevent issues
         self._last_transcript_time = {"Caller": 0, "AI": 0, "Human": 0}
         Log.info("[Takeover] Human takeover DISABLED - AI will resume")
     
@@ -357,10 +446,7 @@ class OpenAIService:
         return getattr(self, '_human_takeover_active', False)
     
     async def send_human_audio_to_openai(self, audio_base64: str, connection_manager):
-        """
-        Send human agent audio to OpenAI for transcription/context.
-        This keeps OpenAI aware of the conversation even during human takeover.
-        """
+        """Send human agent audio to OpenAI for transcription/context."""
         try:
             if connection_manager.is_openai_connected():
                 await connection_manager.send_to_openai({
@@ -368,7 +454,6 @@ class OpenAIService:
                     "audio": audio_base64
                 })
                 
-                # ✅ Manually commit the audio for transcription
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.commit"
                 })
@@ -377,12 +462,8 @@ class OpenAIService:
         except Exception as e:
             Log.error(f"Failed to send human audio to OpenAI: {e}")
 
-    # ✅ Extract human agent transcript
     async def extract_human_transcript(self, event: Dict[str, Any]) -> None:
-        """
-        Extract HUMAN agent transcript from OpenAI transcription.
-        Only triggered when human is in control.
-        """
+        """Extract HUMAN agent transcript from OpenAI transcription."""
         try:
             if not self.is_human_in_control():
                 return
@@ -400,15 +481,12 @@ class OpenAIService:
                 if not cleaned:
                     return
                 
-                # ✅ Convert to Roman script if needed
                 roman_text = await self.roman_converter.convert_to_roman(cleaned)
                 
-                # Filter noise
                 if not self.transcript_filter.is_valid_transcript(roman_text, "Human"):
                     Log.debug(f"[Human] ❌ Filtered: '{roman_text}'")
                     return
                 
-                # Ensure sequential timing
                 current_time = time.time()
                 if current_time < self._last_transcript_time.get("Human", 0):
                     Log.debug(f"[Human] ⏭️ Out-of-order")
@@ -590,11 +668,8 @@ class OpenAIService:
 
     # --- TRANSCRIPT EXTRACTION WITH ROMAN CONVERSION ---
     async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
-        """
-        Extract CALLER transcript and convert to Roman script if needed.
-        """
+        """Extract CALLER transcript and convert to Roman script if needed."""
         try:
-            # ✅ During human takeover, treat transcripts as Human
             if self.is_human_in_control():
                 await self.extract_human_transcript(event)
                 return
@@ -612,15 +687,12 @@ class OpenAIService:
                 if not cleaned:
                     return
                 
-                # ✅ Convert to Roman script if needed
                 roman_text = await self.roman_converter.convert_to_roman(cleaned)
                 
-                # Filter noise
                 if not self.transcript_filter.is_valid_transcript(roman_text, "Caller"):
                     Log.debug(f"[Caller] ❌ Filtered: '{roman_text}'")
                     return
                 
-                # Ensure sequential timing
                 current_time = time.time()
                 if current_time < self._last_transcript_time.get("Caller", 0):
                     Log.debug(f"[Caller] ⏭️ Out-of-order")

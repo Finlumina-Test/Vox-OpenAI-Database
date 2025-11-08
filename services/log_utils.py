@@ -31,6 +31,10 @@ class Log:
         print(f"[{Log._ts()}] ERROR: {msg}")
 
     @staticmethod
+    def warning(msg: str) -> None:
+        print(f"[{Log._ts()}] WARNING: {msg}")
+
+    @staticmethod
     def event(title: str, details: Optional[dict[str, Any]] = None) -> None:
         Log.header(title)
         if details is not None:

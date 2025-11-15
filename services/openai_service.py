@@ -197,7 +197,7 @@ You: "Sorry, I didn't catch that. What would you like to order?"
                             "silence_duration_ms": 300
                         },
                         "transcription": {
-                            "model": "whisper-1",
+                            "model": "gpt-4o-mini-transcribe",
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
